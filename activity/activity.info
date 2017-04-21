@@ -1,0 +1,18 @@
+[Activity]
+implement = %(bundle_id)s
+name      = Sugar Network
+summary   = Sugar activity to distribute Sugar Network clients.
+description = %(summary)s
+homepage  = http://wiki.sugarlabs.org/go/Activities/Sugar_Network
+license   = GPLv3
+
+version   = %(activity_version)s
+stability = stable
+
+icon      = sugar-network
+exec      = sugar-activity activity.SugarNetworkActivity
+
+# Original activity.info options
+# Should not contain .ini file expansions to not break ASLO uploading
+bundle_id = org.sugarlabs.SugarNetworkActivity
+activity_version = 0.7

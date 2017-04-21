@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2012 Aleksey Lim
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+import errno
+import signal
+import locale
+import logging
+from os.path import join, abspath, exists
+
+from gevent import monkey
+
+import active_document as ad
+import sugar_network_webui as webui
+from sugar_network import toolkit, client, node
+from sugar_network.toolkit import sugar, mountpoints
+from sugar_network.toolkit.router import IPCRouter
+from sugar_network.client.mounts import HomeMount, RemoteMount
+from sugar_network.client.mountset import Mountset
+from sugar_network.zerosugar import clones
+from sugar_network.node import stats
+from sugar_network.resources.volume import Volume
+from active_toolkit.options import Option
+from active_toolkit import util, printf, application, coroutine, enforce
+
+
+class Application(application.Daemon):
+
+    def __init__(self, **kwargs):
+        application.Daemon.__init__(self, **kwargs)
+
+        self.jobs = coroutine.Pool()
+        toolkit.init_logging(application.debug.value)
+
+        new_root = (client.local_root.value != client.local_root.default)
+        client.local_root.value = abspath(client.local_root.value)
+        if new_root:
+            application.logdir.value = join(client.local_root.value, 'log')
+        else:
+            application.logdir.value = sugar.profile_path('logs')
+        if not exists(toolkit.tmpdir.value):
+            os.makedirs(toolkit.tmpdir.value)
+        application.rundir.value = join(client.local_root.value, 'run')
+
+        coroutine.signal(signal.SIGCHLD, self.__SIGCHLD_cb)
+
+    @application.command(
+            'index local Sugar Network database')
+    def index(self):
+        if self.check_for_instance():
+            printf.info('%s already started, no need in index', self.name)
+            return
+
+        if not exists(sugar.profile_path('owner.key')):
+            # Command was launched in foreign environment
+            sugar.uid = lambda: 'index'
+            sugar.nickname = lambda: 'index'
+
+        printf.info('Index database in %r', client.local_root.value)
+
+        volume = Volume(client.db_path())
+        try:
+            volume.populate()
+            self._sync(volume)
+            clones.populate(volume['context'], client.activity_dirs.value)
+        finally:
+            volume.close()
+
+    @application.command(hidden=True)
+    def graceful_start(self):
+        """Restart existing process if it was started in different environment.
+
+        This command makes sense only for Sugar Network activity when it is
+        required avoid restarting existing sugar-network-client. But, restart
+        process if it was started in different Sugar session.
+        """
+        pid = self.check_for_instance()
+        if pid:
+            run_environ = _read_environ(pid)
+            if os.environ.get('DISPLAY') == run_environ.get('DISPLAY') and \
+                    os.environ.get('DBUS_SESSION_BUS_ADDRESS') == \
+                    run_environ.get('DBUS_SESSION_BUS_ADDRESS'):
+                printf.info('%s already started in current environment',
+                        self.name)
+                return
+            application.replace.value = True
+        self.cmd_start()
+
+    @application.command(hidden=True)
+    def debug(self):
+        printf.info('Use "start --foreground" command instead')
+        application.foreground.value = True
+        self.cmd_start()
+
+    def run(self):
+        toolkit.ensure_dsa_pubkey(sugar.profile_path('owner.key'))
+        volume = Volume(client.db_path(), lazy_open=client.lazy_open.value)
+        mountset = Mountset(volume)
+        mountset['~'] = HomeMount(volume)
+        mountset['/'] = RemoteMount(volume)
+
+        logging.info('Listening for IPC requests on %s port',
+                client.ipc_port.value)
+        server = coroutine.WSGIServer(('localhost', client.ipc_port.value),
+                IPCRouter(mountset))
+        self.jobs.spawn(server.serve_forever)
+        self.accept()
+
+        def delayed_start(event=None):
+            logging.info('Proceed delayed start')
+            mountset.disconnect(delayed_start)
+
+            self._sync(mountset.volume)
+            self.jobs.spawn(clones.monitor, mountset.volume['context'],
+                    client.activity_dirs.value)
+
+            if webui.webui.value:
+                host = (webui.webui_host.value, webui.webui_port.value)
+                logging.info('Start Web server on %s:%s', *host)
+                server = coroutine.WSGIServer(host, webui.get_app(mountset))
+                self.jobs.spawn(server.serve_forever)
+
+            if client.mounts_root.value:
+                self.jobs.spawn(mountpoints.monitor,
+                        abspath(client.mounts_root.value))
+
+        if client.delayed_start.value:
+            mountset.connect(delayed_start, event='delayed-start')
+        else:
+            delayed_start()
+
+        try:
+            mountset.open()
+            self.jobs.join()
+        except KeyboardInterrupt:
+            util.exception('%s interrupted', self.name)
+        finally:
+            self.jobs.kill()
+            mountset.close()
+
+    def shutdown(self):
+        self.jobs.kill()
+
+    def __SIGCHLD_cb(self):
+        while True:
+            try:
+                pid, __ = os.waitpid(-1, os.WNOHANG)
+                if pid:
+                    continue
+            except OSError, error:
+                if error.errno != errno.ECHILD:
+                    raise
+            break
+
+    def _sync(self, volume):
+        contexts = volume['context']
+        docs, __ = contexts.find(limit=ad.MAX_LIMIT, clone=[1, 2])
+        for context in docs:
+            if not clones.ensure_clones(context.guid):
+                contexts.update(context.guid, clone=0)
+
+
+def _read_environ(pid):
+    with file('/proc/%s/environ' % pid, 'rb') as f:
+        return dict([i.split('=', 1) for i in f.read().split('\0') if i])
+
+
+# Let toolkit.http work in concurrence
+# XXX No DNS because `toolkit.network.res_init()` doesn't work otherwise
+monkey.patch_socket(dns=False)
+monkey.patch_select()
+monkey.patch_ssl()
+monkey.patch_time()
+
+locale.setlocale(locale.LC_ALL, '')
+
+# New defaults
+application.debug.value = sugar.logger_level()
+# It seems to be that most of users (on XO at least) don't have recent SSH
+node.trust_users.value = True
+# If tmpfs is mounted to /tmp, `os.fstat()` will return 0 free space
+# and will brake offline synchronization logic
+toolkit.tmpdir.value = sugar.profile_path('tmp')
+
+Option.seek('main', application)
+Option.seek('webui', webui)
+Option.seek('client', client)
+Option.seek('client', [sugar.keyfile, toolkit.tmpdir])
+Option.seek('node', [node.port, node.sync_dirs])
+Option.seek('stats', stats)
+Option.seek('active-document', ad)
+
+app = Application(
+        name='sugar-network-client',
+        description='Sugar Network client application.',
+        epilog='See http://wiki.sugarlabs.org/go/Sugar_Network ' \
+                 'for details.',
+        config_files=[
+            '/etc/sweets.conf',
+            '~/.config/sweets/config',
+            sugar.profile_path('sweets.conf'),
+            ])
+app.start()
